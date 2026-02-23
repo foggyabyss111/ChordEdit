@@ -35,7 +35,7 @@ DEFAULT_EDIT_CONFIG: Dict[str, Any] = {
     "n_steps": 1,
     "t_start": 0.90,
     "t_end": 0.30,
-    "t_delta": 0.40,
+    "t_delta": 0.15,
     "step_scale": 1.0,
     "cleanup": True,
 }
