@@ -1,4 +1,4 @@
-from __future__ import annotations
+from __future__ import annotations # 支持类型注解中的自引用
 
 import argparse
 import json
@@ -10,22 +10,26 @@ import gradio as gr
 import torch
 from PIL import Image
 
-from pipeline_chord import ChordEditPipeline
-from utils import DEFAULT_DATA_ROOT
+from pipeline_chord import ChordEditPipeline #导入核心编辑管道
+from utils import DEFAULT_DATA_ROOT # 默认数据集根目录
 
 
 LOGGER = logging.getLogger("chord_app")
 
 
 # Model root and component layout.
-COMPONENT_SUBDIRS: Dict[str, str] = {
-    "unet_path": "unet",
-    "scheduler_path": "scheduler",
-    "text_encoder_path": "text_encoder",
-    "tokenizer_path": "tokenizer",
-    "vae_path": "vae",
+# 模型组件子目录映射
+# 定义了每个模型组件在模型根目录下的子文件夹名称
+COMPONENT_SUBDIRS: Dict[str, str] = {   
+    "unet_path": "unet",   # UNet模型权重
+    "scheduler_path": "scheduler",   # 调度器配置
+    "text_encoder_path": "text_encoder",   # 文本编码器
+    "tokenizer_path": "tokenizer",   # 分词器
+    "vae_path": "vae",   # 变分自编码器
 }
 DEFAULT_MODEL_ROOT = "/sd-turbo"
+
+# 默认编辑配置参数
 DEFAULT_COMPONENT_PATHS: Dict[str, str] = {
     key: str(Path(DEFAULT_MODEL_ROOT) / subdir) for key, subdir in COMPONENT_SUBDIRS.items()
 }
@@ -40,15 +44,15 @@ DEFAULT_EDIT_CONFIG: Dict[str, Any] = {
     "cleanup": True,
 }
 
-DEFAULT_SEED = 42
-DEFAULT_PRECISION = "fp32"
-DEFAULT_IMAGE_SIZE = 512
-DEFAULT_MAX_EXAMPLES = 24
-DEFAULT_SERVER_NAME = "127.0.0.1"
-DEFAULT_SERVER_PORT = 7860
-DEFAULT_CENTER_CROP = True
-DEFAULT_USE_ATTENTION_MASK = False
-DEFAULT_USE_SAFETY_CHECKER = False
+DEFAULT_SEED = 42                         # 默认随机种子
+DEFAULT_PRECISION = "fp32"                 # 默认计算精度
+DEFAULT_IMAGE_SIZE = 512                   # 默认图像尺寸
+DEFAULT_MAX_EXAMPLES = 24                   # 最大示例数量
+DEFAULT_SERVER_NAME = "127.0.0.1"           # 服务器地址（本地）
+DEFAULT_SERVER_PORT = 7860                   # 服务器端口
+DEFAULT_CENTER_CROP = True                   # 默认使用中心裁剪
+DEFAULT_USE_ATTENTION_MASK = False           # 默认不使用注意力掩码
+DEFAULT_USE_SAFETY_CHECKER = False           # 默认不使用安全检查器
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 SQUARE_PREVIEW_CSS = """
 #source-image-input {
@@ -202,8 +206,8 @@ def _validate_inputs(
     image: Optional[Image.Image],
     source_prompt: str,
     target_prompt: str,
-    t_start: float,
-    t_end: float,
+    t_start: float,  # 编辑强度起点：扩散模型去噪的时间步。数值越大，对原图的改动潜力越大
+    t_end: float,  # 编辑强度终点：停止去噪的时间步。数值越小，细节还原越真实
     t_delta: float,
 ) -> None:
     if image is None:
@@ -224,20 +228,23 @@ def build_demo(
     default_edit_config: Dict[str, Any],
     examples: List[List[Any]],
 ) -> gr.Blocks:
+    #run_edit :将网页上用户的点击操作和输入，转换成 Python 能够处理的变量和数值
     def run_edit(
-        image: Optional[Image.Image],
-        source_prompt: str,
-        target_prompt: str,
-        seed: float,
+        image: Optional[Image.Image],  #网页上传的图片
+        source_prompt: str,      #用户输入的“原图描述”
+        target_prompt: str,      #用户输入的“目标描述”
+        seed: float,             #随机种子，控制生成的随机性
         n_samples: float,
         t_start: float,
         t_end: float,
         t_delta: float,
         step_scale: float,
     ) -> Image.Image:
+        #1.验证输入：防止用户没传图就点运行
         _validate_inputs(image, source_prompt, target_prompt, t_start, t_end, t_delta)
 
         seed_int = int(seed)
+        #2. 组装配置字典：把网页滑块的值打包好
         edit_config = {
             "noise_samples": int(n_samples),
             "n_steps": int(default_edit_config.get("n_steps", 1)),
@@ -249,6 +256,7 @@ def build_demo(
         }
 
         try:
+        #3. 真正调用 pipeline：这一步会跳到 pipeline_chord.py 执行
             result = pipeline(
                 image=image,
                 source_prompt=source_prompt.strip(),
@@ -265,27 +273,28 @@ def build_demo(
             raise gr.Error("The pipeline did not return PIL images. Please check output_type.")
         if not images:
             raise gr.Error("The pipeline returned no output image.")
-        return images[0]
+        return images[0] #返回处理后的第一张图片到网页显示
 
-    with gr.Blocks(title="ChordEdit App", css=SQUARE_PREVIEW_CSS) as demo:
-        gr.Markdown("# ChordEdit App")
+    #demo 是整个网页的根节点。SQUARE_PREVIEW_CSS 负责网页的样式装修
+    with gr.Blocks(title="ChordEdit App", css=SQUARE_PREVIEW_CSS) as demo: #创建整个网页的大框架
+        gr.Markdown("# ChordEdit App") #在网页顶部写大标题
         gr.Markdown(
             'To study artifacts and background leakage of the one-step editor without Chord Control, set `t_delta` to `0`.\n'
             'Images shown in the paper are available in the "Examples" list below.',
             elem_classes=["panel-note"],
         )
 
-        with gr.Row(elem_id="editor-main-row"):
-            with gr.Column(scale=5, elem_id="left-input-panel"):
-                with gr.Group():
+        with gr.Row(elem_id="editor-main-row"):  #创建主交互行
+            with gr.Column(scale=5, elem_id="left-input-panel"): # 左边栏，宽度比例为5
+                with gr.Group(): #将下面的组件打包在一起，外观上会有个边框
                     with gr.Row():
                         with gr.Column(scale=1, min_width=280):
                             input_image = gr.Image(
                                 type="pil",
                                 label="Source Image",
-                                sources=["upload", "clipboard"],
+                                sources=["upload", "clipboard"], # 允许上传或剪贴板粘贴
                                 elem_id="source-image-input",
-                                height=320,
+                                height=320,  #固定显示高度
                             )
                         with gr.Column(scale=1, min_width=280):
                             source_prompt = gr.Textbox(
@@ -307,15 +316,19 @@ def build_demo(
                 n_samples_default = int(
                     default_edit_config.get("n_samples", default_edit_config.get("noise_samples", 1))
                 )
-                with gr.Row():
+                with gr.Row(): # 开启一个“行”容器。里面缩进的东西都会横着排
+                    # seed_input: 随机数种子输入框。precision=0 表示只能输入整数
                     seed_input = gr.Number(label="Seed", value=int(default_seed), precision=0)
-                    n_samples_input = gr.Slider(
+
+                    # n_samples_input: 采样数量滑块。物理含义：一次生成几张图供参考
+                    n_samples_input = gr.Slider(  #gr.Slider:调节阀
                         label="n_samples",
                         minimum=1,
                         maximum=16,
-                        step=1,
+                        step=1,  #每次拖动的最小间距
                         value=n_samples_default,
                     )
+                    # step_scale_input: 编辑步长缩放。物理含义：每一刀切多深（修改幅度）
                     step_scale_input = gr.Slider(
                         label="step_scale",
                         minimum=0.1,

@@ -1,18 +1,18 @@
-from __future__ import annotations
+from __future__ import annotations # 支持类型注解中的自引用（如类名作为类型)
 
-import argparse
-import json
-import logging
-import shutil
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+import argparse      # 命令行参数解析库
+import json          # JSON文件处理
+import logging       # 日志记录
+import shutil        # 文件复制等高级文件操作
+from dataclasses import dataclass  # 数据类装饰器
+from pathlib import Path            # 跨平台路径处理
+from typing import Any, Dict, List, Optional  # 类型注解
 
 import torch
 from PIL import Image
 
-from pipeline_chord import ChordEditPipeline
-from utils import first_param_point, load_yaml_config
+from pipeline_chord import ChordEditPipeline # 导入核心编辑管道
+from utils import first_param_point, load_yaml_config # 工具函数
 
 
 LOGGER = logging.getLogger("pie_bench")

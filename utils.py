@@ -1,13 +1,13 @@
-from __future__ import annotations
+from __future__ import annotations # 支持类型注解中的自引用
 
 import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
-import yaml
-from PIL import Image, ImageOps
-from torch.utils.data import Dataset
+import yaml # YAML文件解析库
+from PIL import Image, ImageOps # PIL图像处理
+from torch.utils.data import Dataset # PyTorch数据集基类
 
 
 DEFAULT_DATA_ROOT = Path(__file__).resolve().parent / "images"
@@ -149,12 +149,12 @@ def _select_image_file(folder: Path) -> Path:
     return sorted(candidates, key=lambda p: p.name)[0]
 
 
-def _center_square_crop(image: Image.Image) -> Image.Image:
-    width, height = image.size
+def _center_square_crop(image: Image.Image) -> Image.Image: # 强制把任何形状的图片变成“正方形”
+    width, height = image.size  #获取原始图片的宽和高
     if width == height:
-        return image
+        return image 
 
-    target_size = min(width, height)
+    target_size = min(width, height)  # 取短的那根轴作为基准
     try:
         resample = Image.Resampling.LANCZOS  # type: ignore[attr-defined]
     except AttributeError:  # pragma: no cover
