@@ -15,15 +15,18 @@ from pipeline_chord import ChordEditPipeline # 导入核心编辑管道
 from utils import first_param_point, load_yaml_config # 工具函数
 
 
-LOGGER = logging.getLogger("pie_bench")
+LOGGER = logging.getLogger("pie_bench") #获取日志记录器
 
+# 模型组件的子目录映射
+# key: pipeline_chord.py中期望的路径键名
+# value: 相对于模型根目录的子文件夹名称
 # model root + expected component subdirectories
 COMPONENT_SUBDIRS: Dict[str, str] = {
-    "unet_path": "unet",
-    "scheduler_path": "scheduler",
-    "text_encoder_path": "text_encoder",
-    "tokenizer_path": "tokenizer",
-    "vae_path": "vae",
+    "unet_path": "unet",  #uNet 模型权重
+    "scheduler_path": "scheduler", #调度器配置
+    "text_encoder_path": "text_encoder", #文本编码器
+    "tokenizer_path": "tokenizer", #分词器
+    "vae_path": "vae", #VAE 模型
 }
 DEFAULT_MODEL_ROOT = "/sd-turbo"
 DEFAULT_COMPONENT_PATHS: Dict[str, str] = {
@@ -31,17 +34,17 @@ DEFAULT_COMPONENT_PATHS: Dict[str, str] = {
 }
 
 DEFAULT_EDIT_CONFIG = {
-    "noise_samples": 1,
+    "noise_samples": 1,  #噪声样本数（用于蒙特卡洛估计）
     "n_steps": 1,
-    "t_start": 0.90,
+    "t_start": 0.90, #起始时间步 [0,1] (1=纯噪声,0=干净图像)
     "t_end": 0.30,
-    "t_delta": 0.15,
-    "step_scale": 1.0,
-    "cleanup": True,
+    "t_delta": 0.15, #时间差分，用于计算编辑方向
+    "step_scale": 1.0, #步长缩放因子，控制编辑强度
+    "cleanup": True, #是否在编辑后执行清理步骤
 }
 
-DEFAULT_SEED = 42
-DEFAULT_PRECISION = "fp32"
+DEFAULT_SEED = 42  # 默认随机种子
+DEFAULT_PRECISION = "fp32"   # 默认计算精度
 
 DEFAULT_PIE_ROOT = Path(__file__).resolve().parent / "pie_bench"
 DEFAULT_MAPPING_FILE = "mapping_file.json"
@@ -323,15 +326,20 @@ def save_prediction(image: Image.Image, destination: Path, *, overwrite: bool) -
     if overwrite or not destination.exists():
         image.save(destination)
 
+# ============================================================================
+# 主函数
+# ============================================================================
 
 def main() -> None:
+    # === 1. 解析命令行参数 ===
     args = parse_args()
-
+    # === 2. 配置日志 ===
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
 
+    # === 3. 加载配置 ===
     edit_config, seed, precision = load_pipeline_config(args.config)
     edit_config, seed = apply_cli_overrides(args, edit_config, seed)
     component_paths = expand_component_paths(paths_from_model_root(args.model_root))

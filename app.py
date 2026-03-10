@@ -1,12 +1,12 @@
 from __future__ import annotations # 支持类型注解中的自引用
 
-import argparse
-import json
+import argparse # 用于解析命令行参数
+import json #处理示例元数据
 import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import gradio as gr
+import gradio as gr #Gradio: 快速构建机器学习Web应用的库
 import torch
 from PIL import Image
 
@@ -21,27 +21,29 @@ LOGGER = logging.getLogger("chord_app")
 # 模型组件子目录映射
 # 定义了每个模型组件在模型根目录下的子文件夹名称
 COMPONENT_SUBDIRS: Dict[str, str] = {   
-    "unet_path": "unet",   # UNet模型权重
-    "scheduler_path": "scheduler",   # 调度器配置
+    "unet_path": "unet",   # UNet：扩散模型的核心去噪网络，负责预测噪声
+    "scheduler_path": "scheduler",   # 调度器配置 定义如何添加/去除噪声的时间表
     "text_encoder_path": "text_encoder",   # 文本编码器
-    "tokenizer_path": "tokenizer",   # 分词器
+    "tokenizer_path": "tokenizer",   # 分词器：将文本拆分为token ID
     "vae_path": "vae",   # 变分自编码器
 }
+# 默认模型目录
 DEFAULT_MODEL_ROOT = "/sd-turbo"
 
-# 默认编辑配置参数
+# 根据默认根目录构建完整的组件路径
 DEFAULT_COMPONENT_PATHS: Dict[str, str] = {
     key: str(Path(DEFAULT_MODEL_ROOT) / subdir) for key, subdir in COMPONENT_SUBDIRS.items()
 }
 
+# 默认编辑配置参数
 DEFAULT_EDIT_CONFIG: Dict[str, Any] = {
-    "noise_samples": 1,
-    "n_steps": 1,
-    "t_start": 0.90,
-    "t_end": 0.30,
-    "t_delta": 0.15,
-    "step_scale": 1.0,
-    "cleanup": True,
+    "noise_samples": 1,      # 噪声样本数（用于蒙特卡洛估计）
+    "n_steps": 1,            # 编辑迭代步数
+    "t_start": 0.90,         # 起始时间步 [0,1] (1=纯噪声,0=干净图像)，数值越大（接近1.0）表示越靠近噪声端（编辑空间大）
+    "t_end": 0.30,           # 结束时间步 [0, t_start]，数值越小表示越接近原始图像（保真度高）
+    "t_delta": 0.15,         # 时间差分，用于计算编辑方向
+    "step_scale": 1.0,       # 步长缩放因子，控制沿 dv 方向（目标与源的残差）移动的幅度。
+    "cleanup": True,         # 是否执行清理步骤
 }
 
 DEFAULT_SEED = 42                         # 默认随机种子
@@ -54,11 +56,18 @@ DEFAULT_CENTER_CROP = True                   # 默认使用中心裁剪
 DEFAULT_USE_ATTENTION_MASK = False           # 默认不使用注意力掩码
 DEFAULT_USE_SAFETY_CHECKER = False           # 默认不使用安全检查器
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+# ============================================================================
+# CSS样式定义
+# ============================================================================
+
 SQUARE_PREVIEW_CSS = """
+/* 源图像输入容器：强制正方形显示 */
 #source-image-input {
     width: 100% !important;
 }
 
+/* 图像容器,保持1:1的宽高比 */
 #source-image-input .image-container,
 #source-image-input [data-testid="image"] {
     aspect-ratio: 1 / 1 !important;
@@ -149,12 +158,20 @@ def _resolve_component_paths(model_root: str | Path) -> Dict[str, str]:
 
 
 def _select_image_file(folder: Path) -> Path:
+    """从文件夹中选择一个图像文件
+    
+    优先级:
+        1. 文件名是 i, image, original 的文件（不区分大小写）
+        2. 按文件名排序的第一个图像文件
+    """
+    # 找出所有图像文件
     candidates = [
         p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in _IMAGE_EXTENSIONS
     ]
     if not candidates:
         raise FileNotFoundError(f"No RGB image found inside {folder}")
 
+    # 查找优先文件（i, image, original）
     preferred = sorted(
         (p for p in candidates if p.stem.lower() in {"i", "image", "original"}),
         key=lambda p: p.name,
@@ -216,9 +233,9 @@ def _validate_inputs(
         raise gr.Error("Please provide the source image prompt.")
     if not target_prompt or not target_prompt.strip():
         raise gr.Error("Please provide the target image prompt.")
-    if t_start <= t_end:
+    if t_start <= t_end: #必须从噪声多的地方走向噪声少的地方
         raise gr.Error("Invalid parameters: t_start must be greater than t_end.")
-    if t_delta < 0:
+    if t_delta < 0: #时间差不能为负
         raise gr.Error("Invalid parameters: t_delta must be greater than or equal to 0.")
 
 
@@ -244,7 +261,7 @@ def build_demo(
         _validate_inputs(image, source_prompt, target_prompt, t_start, t_end, t_delta)
 
         seed_int = int(seed)
-        #2. 组装配置字典：把网页滑块的值打包好
+        #2. 组装配置字典：把网页滑块的值打包好，将UI参数传递给模型
         edit_config = {
             "noise_samples": int(n_samples),
             "n_steps": int(default_edit_config.get("n_steps", 1)),
@@ -256,7 +273,7 @@ def build_demo(
         }
 
         try:
-        #3. 真正调用 pipeline：这一步会跳到 pipeline_chord.py 执行
+        #3. 调用 pipeline：这一步会跳到 pipeline_chord.py 执行
             result = pipeline(
                 image=image,
                 source_prompt=source_prompt.strip(),
@@ -267,7 +284,7 @@ def build_demo(
         except Exception as exc:
             LOGGER.exception("Editing failed.")
             raise gr.Error(f"Editing failed: {exc}") from exc
-
+        #处理输出（模型返回的是列表，取第一张）
         images = result.images
         if not isinstance(images, list):
             raise gr.Error("The pipeline did not return PIL images. Please check output_type.")
@@ -342,7 +359,7 @@ def build_demo(
                         minimum=0.01,
                         maximum=1.0,
                         step=0.01,
-                        value=float(default_edit_config.get("t_start", 0.90)),
+                        value=float(default_edit_config.get("t_start", 0.90)), 
                     )
                     t_end_input = gr.Slider(
                         label="t_end",
@@ -419,14 +436,14 @@ def main() -> None:
     LOGGER.info("Loaded %d example records from %s", len(examples), dataset_root)
     LOGGER.info("Seed: %s | Default edit config: %s", seed, edit_config)
     LOGGER.info("Component paths: %s", component_paths)
-
+# 模型加载，创建ChordEditPipeline实例
     pipeline = ChordEditPipeline.from_local_weights(
         component_paths=component_paths,
         default_edit_config=edit_config,
-        device=None,
+        device=None,                     # None表示自动选择GPU（如果有）
         torch_dtype=torch_dtype,
-        image_size=DEFAULT_IMAGE_SIZE,
-        use_center_crop=DEFAULT_CENTER_CROP,
+        image_size=DEFAULT_IMAGE_SIZE,      # 输入图像尺寸（512x512）
+        use_center_crop=DEFAULT_CENTER_CROP,    # 是否中心裁剪
         compute_dtype=compute_dtype,
         use_attention_mask=DEFAULT_USE_ATTENTION_MASK,
         use_safety_checker=DEFAULT_USE_SAFETY_CHECKER,

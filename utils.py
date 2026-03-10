@@ -9,7 +9,7 @@ import yaml # YAML文件解析库
 from PIL import Image, ImageOps # PIL图像处理
 from torch.utils.data import Dataset # PyTorch数据集基类
 
-
+# 默认数据集根目录（位于当前文件的上级目录的images文件夹)
 DEFAULT_DATA_ROOT = Path(__file__).resolve().parent / "images"
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
@@ -26,6 +26,7 @@ def first_param_point(params_grid: Dict[str, Sequence[Any]]) -> Dict[str, Any]:
 
     def _pick(value: Sequence[Any] | Any) -> Any:
         if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+            # 如果是序列且不是字符串/字节串，取第一个元素
             if not value:
                 raise ValueError("Param grid contains an empty list; cannot determine default.")
             return value[0]
@@ -105,14 +106,15 @@ def _parse_edit_records(root: Path) -> List[EditRecord]:
             image_path = _select_image_file(subdir)
         except FileNotFoundError:
             continue
-
+        
+        # 读取meta.jsonl文件
         with meta_file.open("r", encoding="utf-8") as handle:
             for line_num, raw_line in enumerate(handle, start=1):
                 raw_line = raw_line.strip()
                 if not raw_line:
                     continue
                 try:
-                    record = json.loads(raw_line)
+                    record = json.loads(raw_line)   # 解析JSON
                 except json.JSONDecodeError as exc:
                     raise ValueError(f"Invalid JSON in {meta_file} at line {line_num}: {exc}") from exc
 
@@ -162,9 +164,9 @@ def _center_square_crop(image: Image.Image) -> Image.Image: # 强制把任何形
 
     return ImageOps.fit(
         image,
-        (target_size, target_size),
+        (target_size, target_size), # 目标尺寸：正方形
         method=resample,
-        centering=(0.5, 0.5),
+        centering=(0.5, 0.5),   #中心对齐
     )
 
 
@@ -173,4 +175,5 @@ def _resize_image(image: Image.Image, size: tuple[int, int]) -> Image.Image:
         resample = Image.Resampling.LANCZOS  # type: ignore[attr-defined]
     except AttributeError:  # pragma: no cover
         resample = Image.LANCZOS
+    # LANCZOS重采样提供高质量缩放
     return image.resize(size, resample=resample)

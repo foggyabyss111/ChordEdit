@@ -2,7 +2,7 @@
 #2.编辑循环（核心）：在 Latent 空间里，根据“源描述”和“目标描述”的差异，计算出一个“修改方向” 
 #3.解码阶段：把修改后的 Latent 变回图片
 
-from __future__ import annotations
+from __future__ import annotations  # 支持类型注解中的自引用（如类名作为类型）
 
 import logging
 from dataclasses import dataclass
@@ -165,9 +165,9 @@ class ChordEditPipeline(DiffusionPipeline):
         component_paths: Dict[str, str], # 包含各组路径的字典 
         *,
         default_edit_config: Optional[Dict[str, Any]] = None,
-        device: Optional[str | torch.device] = None,
+        device: Optional[str | torch.device] = None, 
         torch_dtype: torch.dtype = torch.float32,
-        image_size: int = 512,
+        image_size: int = 512, #image_size=52
         use_center_crop: bool = True,
         compute_dtype: torch.dtype = DEFAULT_COMPUTE_DTYPE,
         use_attention_mask: bool = False,
@@ -231,11 +231,12 @@ class ChordEditPipeline(DiffusionPipeline):
         if missing:
             raise ValueError(f"edit_config is missing required keys: {missing}")
     #2.图像预处理：把图片从像素空间压缩到VAE的latent空间
-        # pixel_values: [1, 3, 512, 512] 的张量，值域[-1,1]
+      #2.1 像素空间归一化（Pixel Space）
+        #状态：RGB 图像 -> 归一化张量。Shape: [Batch, 3, 512, 512], 值域: [-1, 1]。
         pixel_values = self._prepare_image_tensor(image) #pixel_values:标准化的像素值,把图片像素从 [0, 255] 变成了 [-1, 1]
-        #latents:图像的“浓缩特征”，[1, 4, 64, 64]
-        # 4个通道：每个通道编码了图像的不同特征（结构、纹理、颜色等)
-        # 64x64：空间维度，是原图512x512的1/8 ,压缩比约48:1，保留了图像的语义信息，去除了像素级细节
+      #2.2 空间降维映射
+        # 计算目的: 通过 VAE 将高维像素映射到低维连续分布的众数 (Mode) 上。
+        # 状态: Shape 变为 [Batch, 4, 64, 64]。空间尺寸缩小 8 倍，通道数变为 4，保留了深度语义特征。
         latents = self._encode_image_to_latent(pixel_values)
     #3.文本编码：把源文本和目标文本转换成CLIP的特征向量，作为UNet的条件输入
         src_embed = self.encode_prompt([source_prompt]) #src_embed:源文本的CLIP特征，[1, 77, 768]，77：文本的序列长度（padding后），768是每个token的特征维度
@@ -389,9 +390,12 @@ class ChordEditPipeline(DiffusionPipeline):
         images_clamped = images.detach().clamp(0.0, 1.0) #确保输入在[0,1]范围内
         pil_images = self._tensor_to_pil(images_clamped) #tensor → PIL
         try:
+            #提取CLIP特征用于安全检查
             clip_input = self._safety_feature_extractor(images=pil_images, return_tensors="pt").to(self._device)
+            #准备图像输入[batch, H, W, C] 值域[-1,1]
             images_np = np.stack([np.array(img).astype(np.float32) / 255.0 for img in pil_images], axis=0)
-            images_np = images_np * 2.0 - 1.0
+            images_np = images_np * 2.0 - 1.0 #从[0,1]转换到[-1,1]
+            #运行安全检查器
             _, has_nsfw_concept = self._safety_checker(
                 images=images_np,
                 clip_input=clip_input.pixel_values.to(self._device),
@@ -399,86 +403,147 @@ class ChordEditPipeline(DiffusionPipeline):
         except Exception as exc:  # pragma: no cover - runtime guard
             LOGGER.warning("Safety checker failed (%s). Skipping safety checks.", exc)
             return images, [False] * batch
-
+        
+        # === 处理检查结果 ===
+        # 转换为bool列表
         if isinstance(has_nsfw_concept, torch.Tensor):
             has_nsfw = has_nsfw_concept.detach().cpu().to(dtype=torch.bool).tolist()
         else:
             has_nsfw = [bool(flag) for flag in has_nsfw_concept]
 
+        #如果有NSFW内容，用黑屏替换
         if any(has_nsfw):
             for idx, flagged in enumerate(has_nsfw):
                 if flagged:
-                    images[idx] = torch.zeros_like(images[idx])
+                    images[idx] = torch.zeros_like(images[idx]) #全黑图像
         return images, has_nsfw
 
     def _encode_text(self, prompts: Sequence[str]) -> torch.Tensor:
+        """将文本提示编码为CLIP特征向量,作为UNet的条件输入
+        输入:prompts:文本列表
+        输出:[batch, 77, 768] CLIP特征
+            - batch: 文本数量
+            - 77: CLIP的最大文本长度(padding后)
+            - 768: 每个token的特征维度
+            过程:
+            1. 分词器将文本转换为token IDs,进行padding和截断,得到固定长度的输入
+            2. 文本编码器将token IDs转换为特征向量,作为UNet的条件输入,引导图像编辑
+            3. 输出的特征张量被移动到目标设备,并转换为计算精度dtype
+        """
+        # === 1. 分词: 文本 → token IDs ===
         inputs = self.tokenizer(
             list(prompts),
-            padding="max_length",
-            truncation=True,
-            max_length=self.tokenizer.model_max_length,
-            return_tensors="pt",
+            padding="max_length", #padding到相同长度
+            truncation=True,    #截断超长文本
+            max_length=self.tokenizer.model_max_length, #最大长度(77)
+            return_tensors="pt", 
+
         )
+        # input_ids: [batch, 77] - 每个位置是token在词典中的索引
+        # attention_mask: [batch, 77] - 1表示真实token, 0表示padding
+
         input_ids = inputs.input_ids.to(self._device)
         attn_mask = inputs.attention_mask.to(self._device) if self._use_attention_mask else None
+
+        # === 2. 文本编码: token IDs → CLIP特征向量 ===
         outputs = self.text_encoder(input_ids=input_ids, attention_mask=attn_mask)
+        
+        # last_hidden_state: [batch, 77, 768]
+        # 每个位置的768维向量表示该token在上下文中的语义
         if hasattr(outputs, "last_hidden_state"):
             hidden = outputs.last_hidden_state
         else:
-            hidden = outputs[0]
+            hidden = outputs[0] # 兼容旧版本
         return hidden.to(device=self._device, dtype=self._compute_dtype)
-
+    
     def _tensor_to_pil(self, tensor: torch.Tensor) -> List[Image.Image]:
+        """
+        将图像张量转换为PIL Image列表
+        输入: tensor [batch, 3, H, W], 值域[0,1]
+        输出: List[PIL.Image] - 每个元素是一个PIL图像
+        """
+        # 确保在CPU上，值域在[0,1]之间，适合转换为PIL格式
         tensor = tensor.detach().cpu().clamp(0.0, 1.0)
+
+        # ToPILImage转换器: [C, H, W] → PIL Image
         to_pil = transforms.ToPILImage()
         return [to_pil(sample) for sample in tensor]
 
     def _build_vae_transform(self) -> transforms.Compose:
         """Create image->latent preprocessing transform."""
+        """
+        构建VAE的图像预处理流水线
+    步骤:
+        1. 中心裁剪成正方形 (可选)
+        2. Resize到512x512
+        3. PIL → Tensor [0,255] → [0,1]
+        4. Normalize [0,1] → [-1,1]
+        """
         ops: List[Any] = []
+        # === 步骤1: 中心裁剪 (可选) ===
         if self._use_center_crop:
             ops.append(_CenterSquareCropTransform())
             resize_interp = InterpolationMode.LANCZOS
         else:
             resize_interp = InterpolationMode.BILINEAR
+        
+        # === 步骤2: Resize到512x512 ===
         ops.append(
             transforms.Resize(
                 (self.image_size, self.image_size),
                 interpolation=resize_interp,
             )
         )
+
+        # === 步骤3-4: ToTensor + Normalize ===
         ops.extend(
             [
-                transforms.ToTensor(),
-                transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+                transforms.ToTensor(), #[0,255] PIL → [0,1] Tensor
+                transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]), #[0,1] → [-1,1]
             ]
         )
         return transforms.Compose(ops)
 
     def _prepare_edit_params(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        准备并验证编辑参数
+    
+        输入配置参数:
+        noise_samples: 噪声样本数 
+        n_steps: 编辑迭代步数 
+        t_start: 起始时间步 [0,1] 
+        t_end: 结束时间步 [0, t_start] (默认0.3)
+        t_delta: 时间差分 
+        step_scale: 步长缩放因子 
+        cleanup: 是否执行清理步骤 
+        """
         params = dict(cfg)
-        params["noise_samples"] = int(max(1, params["noise_samples"]))
-        params["n_steps"] = int(max(1, params["n_steps"]))
-        params["t_start"] = float(max(0.0, min(1.0, params["t_start"])))
-        params["t_end"] = float(max(0.0, min(params["t_start"], params["t_end"])))
+        # === 参数验证和范围限制 ===
+        params["noise_samples"] = int(max(1, params["noise_samples"])) #至少1个
+        params["n_steps"] = int(max(1, params["n_steps"]))   #至少1步
+        params["t_start"] = float(max(0.0, min(1.0, params["t_start"]))) # [0,1]
+        params["t_end"] = float(max(0.0, min(params["t_start"], params["t_end"]))) # [0, t_start]
+        # t_delta 处理: 确保 t_s - delta >= 0
         t_delta = float(max(0.0, min(1.0, params["t_delta"]))) 
         if t_delta >= params["t_start"]:
+            # 如果delta太大，调整到略小于t_start
             safe_max = max(1, self._max_unet_timestep)
             t_delta = max(0.0, params["t_start"] - 1.0 / safe_max)
         params["t_delta"] = t_delta
-        params["step_scale"] = float(params["step_scale"])
-        params["cleanup"] = bool(params.get("cleanup", False))
+        params["step_scale"] = float(params["step_scale"]) # 编辑强度
+        params["cleanup"] = bool(params.get("cleanup", False)) # 是否执行清理
         return params
 
     def _prepare_noise_list(
         self,
-        latents: torch.Tensor,
-        seed_value: int,
-        num_noises: int,
+        latents: torch.Tensor,  #[1, 4, 64, 64] - 用于确定形状和设备
+        seed_value: int,        # 随机种子，确保可复现
+        num_noises: int,        # 要生成的噪声数量
     ) -> List[torch.Tensor]:
         torch.manual_seed(seed_value)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed_value)
+        #生成 num_noises 个与 latents 相同形状的随机噪声
         noise_list = [
             torch.randn_like(latents, device=latents.device, dtype=self._compute_dtype)
             for _ in range(num_noises)
@@ -570,13 +635,11 @@ class ChordEditPipeline(DiffusionPipeline):
         alpha_prev_b = alpha_prev.unsqueeze(0).expand(num_noises, -1, -1, -1, -1)
         sigma_s_b = sigma_s.unsqueeze(0).expand(num_noises, -1, -1, -1, -1)
         sigma_prev_b = sigma_prev.unsqueeze(0).expand(num_noises, -1, -1, -1, -1)
-        # z_s: 当前时刻s的加噪图；z_prev: 过去时刻 s0 的加噪图
-        # 公式：z = alpha * x + sigma * noise
-        # alpha: 物理含义：保留原始信息的比例。
-        # sigma: 物理含义：添加随机噪声的比例。
-        # 模拟扩散过程
-        z_s = alpha_s_b * x_anchor_b + sigma_s_b * noise_stack #在t时刻，给图像特征加了噪声后的“模糊”状态
-        z_prev = alpha_prev_b * x_anchor_b + sigma_prev_b * noise_stack
+      # 模拟前向扩散过程
+        # 计算目的: 根据 DDPM 公式构造加噪观测值 $z_t = \alpha_t x_0 + \sigma_t \epsilon$。
+        # alpha_b: 信号保留衰减率；sigma_b: 高斯噪声方差注入量。
+        z_s = alpha_s_b * x_anchor_b + sigma_s_b * noise_stack # z_s: 当前时间步 t_s 的加噪特征图
+        z_prev = alpha_prev_b * x_anchor_b + sigma_prev_b * noise_stack #z_prev: 较小时间步 t_s0 (噪声较少) 的加噪特征图
 
         # -------------------------------------------------------------------------
         # 8. 核心堆叠 (Crucial Stack)：将 (s, s0) 和 (src, edit) 组合成一个大批次
@@ -612,9 +675,12 @@ class ChordEditPipeline(DiffusionPipeline):
         x0_all = (samples - sigma_cat * noise_pred) / alpha_cat
         x0_all = x0_all.reshape(num_noises, 4, batch, *x_anchor.shape[1:])
         x_src_p_s, x_tar_p_s, x_src_p_s0, x_tar_p_s0 = x0_all.unbind(dim=1)
-
-        dv_s = (x_tar_p_s - x_src_p_s).sum(dim=0) / float(num_noises) #dv_s 编辑速度（目标预测 - 原始预测）
-        dv_s0 = (x_tar_p_s0 - x_src_p_s0).sum(dim=0) / float(num_noises)
+      # 计算语义位移向量
+        # 计算目的: 在相同的噪声扰动下，计算模型在“目标条件”与“源条件”下的预测差异（即残差）
+        # dv_s 和 dv_s0 是【编辑方向向量】，形状都是 [1, 4, 64, 64]
+        dv_s = (x_tar_p_s - x_src_p_s).sum(dim=0) / float(num_noises) #dv_s (大噪声层): “粗调宏观方向”，把握图像的整体轮廓和结构变化。
+        dv_s0 = (x_tar_p_s0 - x_src_p_s0).sum(dim=0) / float(num_noises)#dv_s0 (小噪声层): “细调微观方向”，修正边缘和纹理细节。
+       
 
     #时间修正与加权平衡：
     # denom: 时间分母，防止除零
@@ -651,12 +717,12 @@ class ChordEditPipeline(DiffusionPipeline):
                 steps=params["n_steps"],
                 device=device,
             ).tolist()
-
+      # 在 Latent 空间中，以 x_src 为起点，一步步走向目标语义。
         x_curr = x_src #从原始latent开始
         for t_s in t_grid: #在多个时间步上迭代
-    #u_hat: 当前时间步的修改方向，编辑位移向量
-    #物理含义：在latent空间中，指向“目标文本语义” 减去“原始文本语义” 的方向
-            u_hat = self._u_estimate(  # u_hat：这一步要走的方向和距离
+        #u_hat: 当前时间步的修改方向，编辑位移向量
+        #物理含义：在latent空间中，指向“目标文本语义” 减去“原始文本语义” 的方向
+            u_hat = self._u_estimate(  # u_hat：这一步要走的方向和距离,是一个【方向向量】，指向目标文本的语义方向
                 x_curr,   # 当前latent
                 src_embed, #原始描述
                 edit_embed, #目标描述
@@ -664,11 +730,14 @@ class ChordEditPipeline(DiffusionPipeline):
                 float(t_s),  #当前时间
                 params["t_delta"],  #时间差分
             )
-            # x_new = x_old + 步长 * 方向
+            # 状态演变: x_{new} = x_{old} + 步长 * 位移向量
             x_curr = x_curr + params["step_scale"] * u_hat #更新当前图像特征
 
         if params["cleanup"]:
+            # [收尾清理阶段]
+            # 计算目的: 利用目标文本引导，直接预测出时间步为 0 的干净状态 $x_0$。
+            # 物理含义: 消除累积的截断误差，强制将 Latent 对齐到清晰的图像流形 (Image Manifold) 上。
             t_end_idx = self._time_to_index(x_src.shape[0], params["t_end"], device=device)
-            x_curr = self._pred_x0(x_curr, t_end_idx, edit_embed, noise[0])
+            x_curr = self._pred_x0(x_curr, t_end_idx, edit_embed, noise[0]) #_pred_x0 的作用:利用 UNet 预测出完全不含噪声的原始状态，把最后一点模糊感去掉，让导出的图片边缘更清晰、纹理更真实
 
         return x_curr #返回编辑后的latent
