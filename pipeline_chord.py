@@ -551,11 +551,16 @@ class ChordEditPipeline(DiffusionPipeline):
         return noise_list
 
     def _time_to_index(self, batch: int, t_scalar: float, device, dtype=torch.long):
+        """将[0,1]的浮点时间转换为离散时间步索引 (0-999)
+    
+           例如: t=0.8 → idx=800 (假设max_timestep=1000)
+        """
         idx = round(self._max_unet_timestep * float(t_scalar))
-        idx = max(0, min(self._max_unet_timestep, idx))
+        idx = max(0, min(self._max_unet_timestep, idx)) #确保在有效范围内
         return torch.full((batch,), idx, device=device, dtype=dtype)
 
     def _get_alpha_sigma(self, tensor: torch.Tensor, timesteps: torch.Tensor):
+        # alphas_cumprod: 累积乘积，来自scheduler
         alphas_cumprod = self.scheduler.alphas_cumprod.to(dtype=torch.float32, device=tensor.device)
         alpha_t = alphas_cumprod[timesteps].sqrt().view(-1, 1, 1, 1)  
         sigma_t = (1 - alphas_cumprod[timesteps]).sqrt().view(-1, 1, 1, 1)
@@ -566,16 +571,26 @@ class ChordEditPipeline(DiffusionPipeline):
         return alpha_t, sigma_t
 
     def _pred_x0(self, x_anchor, timesteps, cond, noise):
-        alpha_t, sigma_t = self._get_alpha_sigma(x_anchor, timesteps)
+        """
+        从带噪图像预测干净图像 x0
+        作用：强制对齐图像流形，去除模糊
+        """
+        # 获取扩散系数
+        # alpha_t: 信号保留比例（越大表示图像越清晰）；# sigma_t: 噪声比例（越大表示噪点越多）
+        alpha_t, sigma_t = self._get_alpha_sigma(x_anchor, timesteps) #x_anchor: [1, 4, 64, 64] - 当前latent ；# timesteps.shape: [1]
+        # 添加噪声：从当前图像得到带噪版本
         z_t = alpha_t * x_anchor + sigma_t * noise
+        #UNet 预测噪声
         noise_pred = self.unet(
-            sample=z_t,
-            timestep=timesteps,
-            encoder_hidden_states=cond,
+            sample=z_t,     # 带噪图像
+            timestep=timesteps, # 当前时间步（告诉UNet现在是第几步）
+            encoder_hidden_states=cond, # 文本条件（告诉UNet想要什么内容）
             return_dict=False,
         )[0]
+        # 4. 反推干净图像：从带噪图像中减去预测的噪声
+        # 这是扩散模型的核心公式：x0 = (z_t - sigma_t * noise_pred) / alpha_t
         x0_pred = (z_t - sigma_t * noise_pred) / alpha_t
-        return x0_pred
+        return x0_pred  # ← 返回更清晰的版本
 
 #_u_estimate 函数：计算修改方向
     def _u_estimate(self, x_anchor, src_embed, edit_embed, noise, t_s: float, delta: float):
@@ -630,7 +645,7 @@ class ChordEditPipeline(DiffusionPipeline):
         x_anchor_b = x_anchor.unsqueeze(0).expand(num_noises, -1, -1, -1, -1)
         #x_anchor:[1, 4, 64, 64] 
         # unsqueeze(0): [1, 1, 4, 64, 64] - 在开头添加一个维度
-        # expand: [num_noises, 1, 4, 64, 64] - 复制num_noises份
+        # expand: [4, 1, 4, 64, 64] - 复制4份
         alpha_s_b = alpha_s.unsqueeze(0).expand(num_noises, -1, -1, -1, -1)
         alpha_prev_b = alpha_prev.unsqueeze(0).expand(num_noises, -1, -1, -1, -1)
         sigma_s_b = sigma_s.unsqueeze(0).expand(num_noises, -1, -1, -1, -1)
@@ -650,12 +665,16 @@ class ChordEditPipeline(DiffusionPipeline):
 
         # 9. 文本条件堆叠：[src, tgt,src,tgt] 对应上面samples的顺序
         conds = torch.cat([src_embed, edit_embed, src_embed, edit_embed], dim=0)
+        # [4, 77, 768]
+        # 为每个噪声样本重复
         repeat_dims = [num_noises] + [1] * (conds.dim() - 1)
         conds = conds.repeat(*repeat_dims)
+        # [num_noises*4, 77, 768]
 
+        # 时间步堆叠：[t_s, t_s, t_s0, t_s0]
         timesteps = torch.cat([t_idx_s, t_idx_s, t_idx_s0, t_idx_s0], dim=0)
         timesteps = timesteps.repeat(num_noises)
-
+        #  准备alpha和sigma用于预测
         alpha_cat = torch.stack(
             [alpha_s_b, alpha_s_b, alpha_prev_b, alpha_prev_b],
             dim=1,
@@ -664,14 +683,15 @@ class ChordEditPipeline(DiffusionPipeline):
             [sigma_s_b, sigma_s_b, sigma_prev_b, sigma_prev_b],
             dim=1,
         ).reshape(num_noises * 4 * batch, 1, 1, 1)
-
+        # 10. 用UNet预测噪声
         noise_pred = self.unet(
             sample=samples,
             timestep=timesteps,
             encoder_hidden_states=conds,
             return_dict=False,
         )[0]
-
+        #UNet预测噪声形状[16, 4, 64, 64] 
+        # 从带噪图像预测干净图像 x0
         x0_all = (samples - sigma_cat * noise_pred) / alpha_cat
         x0_all = x0_all.reshape(num_noises, 4, batch, *x_anchor.shape[1:])
         x_src_p_s, x_tar_p_s, x_src_p_s0, x_tar_p_s0 = x0_all.unbind(dim=1)
@@ -708,12 +728,13 @@ class ChordEditPipeline(DiffusionPipeline):
         params: Dict[str, Any], #输入5：编辑参数
     ) -> torch.Tensor:          #输出：[1, 4, 64, 64] - 编辑后的latent
         device = x_src.device
+        # 创建从 t_start 到 t_end 的时间步网格
         if params["n_steps"] == 1:
             t_grid = [params["t_start"]] 
         else:
             t_grid = torch.linspace(
-                params["t_start"],
-                params["t_end"],
+                params["t_start"],      # ← 从高噪声开始（编辑广度）
+                params["t_end"],        # ← 到低噪声结束（细节保真）
                 steps=params["n_steps"],
                 device=device,
             ).tolist()
@@ -731,7 +752,7 @@ class ChordEditPipeline(DiffusionPipeline):
                 params["t_delta"],  #时间差分
             )
             # 状态演变: x_{new} = x_{old} + 步长 * 位移向量
-            x_curr = x_curr + params["step_scale"] * u_hat #更新当前图像特征
+            x_curr = x_curr + params["step_scale"] * u_hat #更新当前图像特征,
 
         if params["cleanup"]:
             # [收尾清理阶段]

@@ -313,6 +313,7 @@ def build_demo(
                                 elem_id="source-image-input",
                                 height=320,  #固定显示高度
                             )
+                        # 右侧子列：文本输入
                         with gr.Column(scale=1, min_width=280):
                             source_prompt = gr.Textbox(
                                 label="Source Prompt",
@@ -415,8 +416,12 @@ def build_demo(
 
     return demo
 
+# ============================================================================
+# 主函数
+# ============================================================================
 
 def main() -> None:
+
     args = parse_args()
 
     logging.basicConfig(
@@ -440,7 +445,7 @@ def main() -> None:
     pipeline = ChordEditPipeline.from_local_weights(
         component_paths=component_paths,
         default_edit_config=edit_config,
-        device=None,                     # None表示自动选择GPU（如果有）
+        device=None,                     # None表示自动选择（GPU优先））
         torch_dtype=torch_dtype,
         image_size=DEFAULT_IMAGE_SIZE,      # 输入图像尺寸（512x512）
         use_center_crop=DEFAULT_CENTER_CROP,    # 是否中心裁剪
@@ -448,7 +453,7 @@ def main() -> None:
         use_attention_mask=DEFAULT_USE_ATTENTION_MASK,
         use_safety_checker=DEFAULT_USE_SAFETY_CHECKER,
     )
-
+    # 构建并启动Gradio应用
     demo = build_demo(
         pipeline=pipeline,
         default_seed=seed,
@@ -456,7 +461,7 @@ def main() -> None:
         examples=examples,
     )
 
-    demo.queue(api_open=False)
+    demo.queue(api_open=False)  #启用队列，但关闭API访问
     demo.launch(
         server_name=DEFAULT_SERVER_NAME,
         server_port=args.server_port,

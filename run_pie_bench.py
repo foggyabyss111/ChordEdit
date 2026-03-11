@@ -46,25 +46,28 @@ DEFAULT_EDIT_CONFIG = {
 DEFAULT_SEED = 42  # 默认随机种子
 DEFAULT_PRECISION = "fp32"   # 默认计算精度
 
-DEFAULT_PIE_ROOT = Path(__file__).resolve().parent / "pie_bench"
-DEFAULT_MAPPING_FILE = "mapping_file.json"
-DEFAULT_IMAGE_SUBDIR = "annotation_images"
-DEFAULT_METHOD_NAME = "ChordEdit"
+# PIE-Bench数据集相关默认路径
+DEFAULT_PIE_ROOT = Path(__file__).resolve().parent / "pie_bench"  #PIE 数据集根目录
+DEFAULT_MAPPING_FILE = "mapping_file.json"      #映射文件名
+DEFAULT_IMAGE_SUBDIR = "annotation_images"      #图像子目录名
+DEFAULT_METHOD_NAME = "ChordEdit"                 #方法名称（用于输出目录）
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True) # frozen=True 使实例不可变，类似只读对象
 class PieRecord:
-    sample_id: str
+    sample_id: str      #样本唯一ID
     image_path: Path
-    relative_path: Path
-    original_prompt: str
-    edited_prompt: str
-    edit_instruction: str
+    relative_path: Path     #相对于数据集根目录的路径（用于保持目录结构）
+    original_prompt: str    #原始图像描述（源文本）
+    edited_prompt: str      #编辑后图像描述（目标文本）
+    edit_instruction: str      #编辑指令
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run ChordEdit on PIE-Bench data and export PIE-format results.")
+    # === 配置相关参数 ===
     parser.add_argument("--config", type=str, default=None, help="Optional YAML config describing edit params.")
+    # === 模型相关参数 ===
     parser.add_argument(
         "--model-root",
         type=str,
@@ -73,6 +76,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--device", type=str, default=None, help="Torch device override, e.g. cuda:0 or cpu.")
     parser.add_argument("--precision", choices=["fp32", "fp16", "bf16"], default=None, help="Computation precision.")
+    # === 编辑参数（可覆盖配置文件的设置）===
     parser.add_argument("--seed", type=int, default=None, help="Random seed overriding the config file.")
     parser.add_argument("--noise-samples", type=int, default=None, help="Number of MC noise samples.")
     parser.add_argument("--n-steps", type=int, default=None, help="Number of Chord iterations.")
@@ -82,6 +86,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--step-scale", type=float, default=None, help="Edit update magnitude.")
     parser.add_argument("--cleanup", action="store_true", help="Force cleanup on.")
     parser.add_argument("--no-cleanup", action="store_true", help="Force cleanup off.")
+    # cleanup参数
     parser.add_argument(
         "--center-crop",
         dest="center_crop",
@@ -89,6 +94,7 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Center-crop before resize for VAE preprocessing (default).",
     )
+    # === 预处理参数 ===
     parser.add_argument(
         "--no-center-crop",
         dest="center_crop",
@@ -100,6 +106,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Pass attention masks to the text encoder (defaults off to mirror chord/src).",
     )
+    # === 安全检查参数 ===
     parser.add_argument(
         "--safety-checker",
         dest="use_safety_checker",
@@ -116,6 +123,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-size", type=int, default=512, help="Resolution used when feeding the VAE.")
     parser.add_argument("--max-samples", type=int, default=None, help="Only process the first N records.")
 
+    # === PIE数据集路径参数 ===
     parser.add_argument("--pie-root", type=str, default=None, help="Root directory of PIE-Bench data.")
     parser.add_argument(
         "--mapping-file",
@@ -190,12 +198,13 @@ def dtype_from_precision(value: Optional[str]) -> torch.dtype:
 
 def expand_component_paths(path_map: Dict[str, Optional[str]]) -> Dict[str, str]:
     expanded: Dict[str, str] = {}
-    for key in COMPONENT_SUBDIRS:
+    for key in COMPONENT_SUBDIRS:   #遍历所以必需的组件
         value = path_map.get(key)
-        fallback = DEFAULT_COMPONENT_PATHS.get(key)
+        fallback = DEFAULT_COMPONENT_PATHS.get(key) #默认路径
         final_value = value if value is not None else fallback
         if final_value is None:
             raise ValueError(f"Missing required path for '{key}'. Provide via config or CLI.")
+        # 扩展用户目录(~)并转换为绝对路径
         expanded[key] = str(Path(final_value).expanduser().resolve())
     return expanded
 
@@ -209,8 +218,8 @@ def load_pipeline_config(path: Optional[str]) -> tuple[Dict[str, Any], int, Opti
     if path is None:
         return (dict(DEFAULT_EDIT_CONFIG), DEFAULT_SEED, DEFAULT_PRECISION)
 
-    cfg = load_yaml_config(path)
-    editor_cfg = cfg.get("editor", {})
+    cfg = load_yaml_config(path)        # 加载YAML
+    editor_cfg = cfg.get("editor", {})      # 获取editor部分
     seed_value = editor_cfg.get("seed")
     if seed_value is None:
         seed_list = editor_cfg.get("seed_list")
@@ -340,10 +349,14 @@ def main() -> None:
     )
 
     # === 3. 加载配置 ===
+    #从YAML文件加载编辑配置、种子和精度
     edit_config, seed, precision = load_pipeline_config(args.config)
+    # 用命令行参数覆盖配置
     edit_config, seed = apply_cli_overrides(args, edit_config, seed)
+    # 构建组件路径
     component_paths = expand_component_paths(paths_from_model_root(args.model_root))
 
+    #=== 4. 处理精度 ===
     precision_choice_raw = args.precision or precision or DEFAULT_PRECISION
     precision_choice = precision_choice_raw.lower()
     if precision_choice != "fp32":
@@ -351,17 +364,17 @@ def main() -> None:
             "Precision '%s' requested, but PIE export forces fp32 for numerical stability.",
             precision_choice_raw,
         )
-        precision_choice = "fp32"
-    torch_dtype = dtype_from_precision(precision_choice)
-    compute_dtype = torch.float32
-
+        precision_choice = "fp32" # PIE导出强制使用fp32保证数值稳定性
+    torch_dtype = dtype_from_precision(precision_choice) # 模型权重精度
+    compute_dtype = torch.float32  # 计算精度（固定为fp32）
+    # === 5. 解析PIE数据集路径 ===
     pie_root = Path(args.pie_root).expanduser().resolve() if args.pie_root else DEFAULT_PIE_ROOT
     export_root = Path(args.export_root).expanduser().resolve() if args.export_root else pie_root
     mapping_path = resolve_path(pie_root, args.mapping_file)
-
+    # === 6. 加载PIE记录 ===
     records = load_pie_records(pie_root, mapping_path, args.image_subdir)
     if args.max_samples is not None:
-        records = records[: args.max_samples]
+        records = records[: args.max_samples] # 只处理前N个样本
 
     if not records:
         LOGGER.error("No PIE records to process. Check dataset paths.")
@@ -374,7 +387,7 @@ def main() -> None:
         mapping_path,
     )
     LOGGER.info("Seed %s | Edit config %s", seed, edit_config)
-
+    # === 7. 初始化管道 ===
     pipeline = ChordEditPipeline.from_local_weights(
         component_paths=component_paths,
         default_edit_config=edit_config,
@@ -386,17 +399,21 @@ def main() -> None:
         use_attention_mask=args.use_attention_mask,
         use_safety_checker=args.use_safety_checker,
     )
-
+    # === 8. 准备输出目录 ===
+    # 输出目录: export_root/output/method_name/output_subdir/
     output_dir = export_root / "output" / args.method_name / args.output_subdir
+    # 源图像目录: export_root/data/source_subdir/
     source_dir = export_root / "data" / args.source_subdir
     ensure_dir(output_dir)
     if args.copy_source:
         ensure_dir(source_dir)
 
+    # === 9. 同步映射文件（如果需要） ===
     if not args.no_sync_mapping:
         sync_mapping_file(mapping_path, export_root, args.mapping_dest, overwrite=args.overwrite)
         LOGGER.info("Synchronized mapping file to %s", resolve_path(export_root, args.mapping_dest))
-
+    
+    # === 10. 处理所有样本 ===
     processed = 0
     skipped = 0
 
@@ -405,41 +422,41 @@ def main() -> None:
         if rel_output_path.exists() and not args.overwrite:
             skipped += 1
             continue
-
+        # === 10.1 加载原始图像 ===
         try:
             with Image.open(record.image_path) as img:
-                source_image = img.convert("RGB")
+                source_image = img.convert("RGB") #确保是RGB 格式
         except Exception as exc:  # pragma: no cover - defensive
             LOGGER.error("Failed to read %s: %s", record.image_path, exc)
             skipped += 1
             continue
-
+        # === 10.2 运行编辑管道 ===
         try:
             result = pipeline(
                 image=source_image,
-                source_prompt=record.original_prompt,
-                target_prompt=record.edited_prompt,
+                source_prompt=record.original_prompt,   #源描述
+                target_prompt=record.edited_prompt, #目标描述
                 seed=seed,
-                output_type="pil",
+                output_type="pil",      #输出PIL格式
             )
         except Exception as exc:  # pragma: no cover - runtime safety
             LOGGER.error("Pipeline failed on %s: %s", record.sample_id, exc)
             skipped += 1
             continue
-
+        # === 10.3 提取生成的图像 ===
         images = result.images
         if isinstance(images, list) and images:
             generated = images[0]
         elif torch.is_tensor(images):
-            # Fall back to tensor output if requested differently.
+            # 如果输出是tensor，转换为PIL
             generated = pipeline._tensor_to_pil(images)[0]  # type: ignore[attr-defined]
         else:
             LOGGER.warning("No images returned for sample %s; skipping.", record.sample_id)
             skipped += 1
             continue
-
+        # === 10.4 保存结果 ===
         save_prediction(generated, rel_output_path, overwrite=args.overwrite)
-
+        # === 10.5 复制源图像（如果需要） ===
         if args.copy_source:
             target_source_path = source_dir / record.relative_path
             copy_file(record.image_path, target_source_path, overwrite=args.overwrite)
