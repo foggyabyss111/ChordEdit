@@ -3,6 +3,7 @@ from __future__ import annotations # 支持类型注解中的自引用（如类�
 import argparse      # 命令行参数解析库
 import json          # JSON文件处理
 import logging       # 日志记录
+import os
 import shutil        # 文件复制等高级文件操作
 from dataclasses import dataclass  # 数据类装饰器
 from pathlib import Path            # 跨平台路径处理
@@ -28,7 +29,28 @@ COMPONENT_SUBDIRS: Dict[str, str] = {
     "tokenizer_path": "tokenizer", #分词器
     "vae_path": "vae", #VAE 模型
 }
-DEFAULT_MODEL_ROOT = "/sd-turbo"
+def _default_model_root() -> str:
+    project_dir = Path(__file__).resolve().parent
+    env_root = os.getenv("CHORDEDIT_MODEL_ROOT")
+    candidates: List[Path] = []
+    if env_root:
+        candidates.append(Path(env_root))
+    candidates.extend(
+        [
+            project_dir / "sd-turbo",
+            project_dir.parent / "sd-turbo",
+            Path("/sd-turbo"),
+            Path("D:/sd-turbo"),
+        ]
+    )
+    for candidate in candidates:
+        resolved = candidate.expanduser().resolve()
+        if resolved.is_dir():
+            return str(resolved)
+    return str((project_dir / "sd-turbo").resolve())
+
+
+DEFAULT_MODEL_ROOT = _default_model_root()
 DEFAULT_COMPONENT_PATHS: Dict[str, str] = {
     key: str(Path(DEFAULT_MODEL_ROOT) / subdir) for key, subdir in COMPONENT_SUBDIRS.items()
 }
@@ -214,6 +236,21 @@ def paths_from_model_root(model_root: str | Path) -> Dict[str, str]:
     return {key: str((root / subdir).resolve()) for key, subdir in COMPONENT_SUBDIRS.items()}
 
 
+def validate_component_paths(component_paths: Dict[str, str], model_root: str | Path) -> None:
+    missing = [f"{key}={value}" for key, value in component_paths.items() if not Path(value).is_dir()]
+    if not missing:
+        return
+    required = ", ".join(COMPONENT_SUBDIRS.values())
+    checked_root = str(Path(model_root).expanduser().resolve())
+    missing_text = "; ".join(missing)
+    raise FileNotFoundError(
+        f"Model components not found. model_root={checked_root}. "
+        f"Required subfolders: {required}. Missing: {missing_text}. "
+        "Please download https://huggingface.co/stabilityai/sd-turbo and run: "
+        "python run_pie_bench.py --model-root <path-to-sd-turbo> --pie-root <path-to-pie_bench>"
+    )
+
+
 def load_pipeline_config(path: Optional[str]) -> tuple[Dict[str, Any], int, Optional[str]]:
     if path is None:
         return (dict(DEFAULT_EDIT_CONFIG), DEFAULT_SEED, DEFAULT_PRECISION)
@@ -355,6 +392,7 @@ def main() -> None:
     edit_config, seed = apply_cli_overrides(args, edit_config, seed)
     # 构建组件路径
     component_paths = expand_component_paths(paths_from_model_root(args.model_root))
+    validate_component_paths(component_paths, model_root=args.model_root)
 
     #=== 4. 处理精度 ===
     precision_choice_raw = args.precision or precision or DEFAULT_PRECISION

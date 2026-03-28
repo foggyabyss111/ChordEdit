@@ -3,6 +3,7 @@ from __future__ import annotations # 支持类型注解中的自引用
 import argparse # 用于解析命令行参数
 import json #处理示例元数据
 import logging
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -28,7 +29,28 @@ COMPONENT_SUBDIRS: Dict[str, str] = {
     "vae_path": "vae",   # 变分自编码器
 }
 # 默认模型目录
-DEFAULT_MODEL_ROOT = "/sd-turbo"
+def _default_model_root() -> str:
+    project_dir = Path(__file__).resolve().parent
+    env_root = os.getenv("CHORDEDIT_MODEL_ROOT")
+    candidates: List[Path] = []
+    if env_root:
+        candidates.append(Path(env_root))
+    candidates.extend(
+        [
+            project_dir / "sd-turbo",
+            project_dir.parent / "sd-turbo",
+            Path("/sd-turbo"),
+            Path("D:/sd-turbo"),
+        ]
+    )
+    for candidate in candidates:
+        resolved = candidate.expanduser().resolve()
+        if resolved.is_dir():
+            return str(resolved)
+    return str((project_dir / "sd-turbo").resolve())
+
+
+DEFAULT_MODEL_ROOT = _default_model_root()
 
 # 根据默认根目录构建完整的组件路径
 DEFAULT_COMPONENT_PATHS: Dict[str, str] = {
@@ -55,6 +77,8 @@ DEFAULT_SERVER_PORT = 7860                   # 服务器端口
 DEFAULT_CENTER_CROP = True                   # 默认使用中心裁剪
 DEFAULT_USE_ATTENTION_MASK = False           # 默认不使用注意力掩码
 DEFAULT_USE_SAFETY_CHECKER = False           # 默认不使用安全检查器
+DEFAULT_INSERTION_MODE = False
+DEFAULT_INSERTION_THRESHOLD_TAU = 0.5
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 # ============================================================================
@@ -157,6 +181,21 @@ def _resolve_component_paths(model_root: str | Path) -> Dict[str, str]:
     return _expand_paths(_paths_from_model_root(model_root))
 
 
+def _validate_component_paths(component_paths: Dict[str, str], model_root: str | Path) -> None:
+    missing = [f"{key}={value}" for key, value in component_paths.items() if not Path(value).is_dir()]
+    if not missing:
+        return
+    required = ", ".join(COMPONENT_SUBDIRS.values())
+    checked_root = str(Path(model_root).expanduser().resolve())
+    missing_text = "; ".join(missing)
+    raise FileNotFoundError(
+        f"Model components not found. model_root={checked_root}. "
+        f"Required subfolders: {required}. Missing: {missing_text}. "
+        "Please download https://huggingface.co/stabilityai/sd-turbo and run: "
+        "python app.py --model-root <path-to-sd-turbo>"
+    )
+
+
 def _select_image_file(folder: Path) -> Path:
     """从文件夹中选择一个图像文件
     
@@ -256,6 +295,8 @@ def build_demo(
         t_end: float,
         t_delta: float,
         step_scale: float,
+        insertion_mode: bool,
+        insertion_threshold_tau: float,
     ) -> Image.Image:
         #1.验证输入：防止用户没传图就点运行
         _validate_inputs(image, source_prompt, target_prompt, t_start, t_end, t_delta)
@@ -273,14 +314,23 @@ def build_demo(
         }
 
         try:
-        #3. 调用 pipeline：这一步会跳到 pipeline_chord.py 执行
-            result = pipeline(
-                image=image,
-                source_prompt=source_prompt.strip(),
-                target_prompt=target_prompt.strip(),
-                edit_config=edit_config,
-                seed=seed_int,
-            )
+            if bool(insertion_mode):
+                result = pipeline.insert_object(
+                    image=image,
+                    source_prompt=source_prompt.strip(),
+                    target_prompt=target_prompt.strip(),
+                    edit_config=edit_config,
+                    seed=seed_int,
+                    threshold_tau=float(insertion_threshold_tau),
+                )
+            else:
+                result = pipeline(
+                    image=image,
+                    source_prompt=source_prompt.strip(),
+                    target_prompt=target_prompt.strip(),
+                    edit_config=edit_config,
+                    seed=seed_int,
+                )
         except Exception as exc:
             LOGGER.exception("Editing failed.")
             raise gr.Error(f"Editing failed: {exc}") from exc
@@ -376,7 +426,18 @@ def build_demo(
                         step=0.01,
                         value=float(default_edit_config.get("t_delta", 0.15)),
                     )
-
+                with gr.Row():
+                    insertion_mode_input = gr.Checkbox(
+                        label="Object Insertion Mode",
+                        value=DEFAULT_INSERTION_MODE,
+                    )
+                    insertion_threshold_tau_input = gr.Slider(
+                        label="Insertion threshold_tau",
+                        minimum=0.0,
+                        maximum=1.0,
+                        step=0.01,
+                        value=DEFAULT_INSERTION_THRESHOLD_TAU,
+                    )
                 run_button = gr.Button("Run Edit", variant="primary")
 
             with gr.Column(scale=5, elem_id="right-output-panel"):
@@ -398,6 +459,8 @@ def build_demo(
             t_end_input,
             t_delta_input,
             step_scale_input,
+            insertion_mode_input,
+            insertion_threshold_tau_input,
         ]
 
         run_button.click(fn=run_edit, inputs=run_inputs, outputs=output_image)
@@ -430,6 +493,7 @@ def main() -> None:
     )
 
     component_paths = _resolve_component_paths(model_root=args.model_root)
+    _validate_component_paths(component_paths, model_root=args.model_root)
     edit_config = dict(DEFAULT_EDIT_CONFIG)
     seed = DEFAULT_SEED
     torch_dtype = _dtype_from_precision(DEFAULT_PRECISION)
