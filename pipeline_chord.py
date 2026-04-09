@@ -1,12 +1,15 @@
-#1.编码阶段：把图片变成 Latent（压缩数据），把文字变成 Embeddings（特征向量）
-#2.编辑循环（核心）：在 Latent 空间里，根据“源描述”和“目标描述”的差异，计算出一个“修改方向” 
-#3.解码阶段：把修改后的 Latent 变回图片
+"""
+ChordEdit Pipeline 核心机制：
+1. 编码阶段：将图片编码为 Latent（压缩隐特征），将文字编码为 Embeddings（语义特征向量）。
+2. 编辑循环：在 Latent 空间中，根据“源描述”和“目标描述”的语义差计算出“修改方向”（位移向量），并逐步迭代。
+3. 解码阶段：将修改后的 Latent 还原为像素空间的图片。
+"""
 
 from __future__ import annotations  # 支持类型注解中的自引用（如类名作为类型）
 
-import logging
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence
+import logging  # 日志记录模块，用于输出调试信息和警告
+from dataclasses import dataclass   # 用于创建数据类（简单的容器）
+from typing import Any, Dict, List, Optional, Sequence  # 类型提示工具
 
 import numpy as np  # 导入 NumPy，用于多维数组的数学运算
 import torch
@@ -40,32 +43,39 @@ class ContextFlowInsertAttnProcessor:
     """
     def __init__(self, layer_index: int, enabled: bool) -> None:
         self.layer_index = int(layer_index) # 记录当前注意力层的索引
-        self.enabled = bool(enabled)        # 是否在该层启用 (仅前25%的浅层为True)
+        self.enabled = bool(enabled)        # 是否在该层启用 ContextFlow 拦截
 
     def __call__(
         self,
         attn,
         hidden_states: torch.Tensor,        # 当前层输入的特征图 [batch, seq_len, dim]
-        encoder_hidden_states: Optional[torch.Tensor] = None, # 文本条件输入 (若是自注意力则为 None)
-        attention_mask: Optional[torch.Tensor] = None,
-        temb: Optional[torch.Tensor] = None,
-        contextflow_state: Optional[Dict[str, Any]] = None,   # 外部传入的状态控制信号
+        encoder_hidden_states: Optional[torch.Tensor] = None,  # 文本条件输入 (若是自注意力则为 None)
+        attention_mask: Optional[torch.Tensor] = None,         # 注意力掩码
+        temb: Optional[torch.Tensor] = None,                   # 时间步嵌入特征
+        contextflow_state: Optional[Dict[str, Any]] = None,    # 外部传入的状态控制信号
         *args,
         **kwargs,
     ) -> torch.Tensor:
+        # ==========================================
         # [基础注意力准备阶段]
-        residual = hidden_states
+        # ==========================================
+        residual = hidden_states    # 保存残差连接的输入
+
+        # 空间归一化处理（如果该层存在）
         if attn.spatial_norm is not None:
             hidden_states = attn.spatial_norm(hidden_states, temb)
         input_ndim = hidden_states.ndim
-        if input_ndim == 4: # 将图像特征 [B, C, H, W] 展平为序列 [B, H*W, C] 供注意力机制使用
+        # 将 2D 图像特征 [B, C, H, W] 展平为 1D 序列 [B, H*W, C] 供 Transformer 处理
+        if input_ndim == 4: 
             batch_size, channel, height, width = hidden_states.shape
             hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
-        
+        # 判断当前是交叉注意力（图文交互）还是自注意力（图图交互）
         is_cross_attention = encoder_hidden_states is not None
         batch_size, sequence_length, _ = (
             hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
         )
+
+        # 准备注意力掩码和组归一化
         attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
         if attn.group_norm is not None:
             hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
@@ -73,16 +83,19 @@ class ContextFlowInsertAttnProcessor:
         # 提取 Query (Q 永远只来自当前分支)
         query = attn.to_q(hidden_states)
         
+        # 处理 Key 和 Value 的来源
         if encoder_hidden_states is None:
-            encoder_hidden_states = hidden_states
+            encoder_hidden_states = hidden_states   # 自注意力：K/V 来自图像本身
         elif attn.norm_cross:
             encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
             
         key_states_edit = encoder_hidden_states
         value_states_edit = encoder_hidden_states
 
+        # ==========================================
         # [ContextFlow 拦截判定]
-        # 条件: 1. 外部传入了激活信号 2. 该层被允许注入 3. 必须是自注意力层 (Cross-Attn负责文本，不碰)
+        # 条件: 1. 外部传入激活信号 2. 当前层允许注入 3. 必须是自注意力层 (保护文本交叉注意力)
+        # ==========================================
         should_use_contextflow = (
             bool(contextflow_state is not None)
             and bool(contextflow_state.get("enabled", False))
@@ -92,7 +105,7 @@ class ContextFlowInsertAttnProcessor:
         
         if should_use_contextflow and contextflow_state is not None:
             mode = str(contextflow_state.get("mode", ""))
-            # mode == "paired" 说明当前是一个将[重建, 编辑]拼接成 Batch=2 的前向传播
+            # 确认当前处于双路径并行模式且批次大小为偶数
             if mode == "paired" and key_states_edit.shape[0] % 2 == 0 and attention_mask is None:
                 half = key_states_edit.shape[0] // 2
                 
@@ -112,7 +125,7 @@ class ContextFlowInsertAttnProcessor:
                 key_aug = torch.cat([key_edit, key_res], dim=1)
                 value_aug = torch.cat([value_edit, value_res], dim=1)
                 
-                # 维度转换 (转给多头注意力计算)
+                # 调整维度以适应多头注意力 (Multi-Head Attention) 的计算格式
                 query_res = attn.head_to_batch_dim(query_res)
                 key_res = attn.head_to_batch_dim(key_res)
                 value_res = attn.head_to_batch_dim(value_res)
@@ -121,23 +134,24 @@ class ContextFlowInsertAttnProcessor:
                 value_aug = attn.head_to_batch_dim(value_aug)
                 
                 # 3. 分别计算注意力
-                # 优化3: 极致显存优化。重建分支只是为了提供 KV，其自身的输出对最终编辑结果无用。
-                # 所以我们完全跳过重建分支的 Attention 计算，用全零张量占位，节省一半显存和算力！
+                # 优化: 重建分支仅用于提供 KV，其输出可直接置零以节省显存和算力
                 out_res = torch.zeros_like(query_res)
                 out_res = attn.batch_to_head_dim(out_res)
                 
-                # 编辑分支: Q_edit 带着目标语义，在 K_aug/V_aug (自身+原图背景) 中寻址融合
+                # 编辑分支: 在扩充后的 KV 空间中寻找相似性进行特征融合
                 probs_edit = attn.get_attention_scores(query_edit, key_aug, None)
-                out_edit = torch.bmm(probs_edit, value_aug)
-                out_edit = attn.batch_to_head_dim(out_edit)
+                out_edit = torch.bmm(probs_edit, value_aug)     
+                out_edit = attn.batch_to_head_dim(out_edit)    
                 
                 # 4. 重新拼接回 Batch=2 并输出 (为了保持后续网络层的 Batch 维度一致)
                 hidden_states = torch.cat([out_res, out_edit], dim=0)
-                hidden_states = attn.to_out[0](hidden_states)
-                hidden_states = attn.to_out[1](hidden_states)
+                hidden_states = attn.to_out[0](hidden_states)   # 线性层投影
+                hidden_states = attn.to_out[1](hidden_states)   # Dropout层
                 
+                # 恢复图像原始的 2D 空间形状 [B, C, H, W]
                 if input_ndim == 4:
                     hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
+                # 加上之前的残差
                 if attn.residual_connection:
                     hidden_states = hidden_states + residual
                 hidden_states = hidden_states / attn.rescale_output_factor
@@ -170,8 +184,8 @@ class ContextFlowInsertAttnProcessor:
 
 @dataclass
 class ChordEditPipelineOutput(BaseOutput):
-    images: List[Image.Image] | torch.Tensor #输出的图像（PIL格式或张量）
-    latents: torch.Tensor #对应的潜在空间表示
+    images: List[Image.Image] | torch.Tensor    # 输出的图像（PIL格式或张量）
+    latents: torch.Tensor                      # 对应的潜在空间表示
 
 class _CenterSquareCropTransform:
     """Center-crop the shorter image dimension before resizing."""
@@ -252,34 +266,31 @@ class ChordEditPipeline(DiffusionPipeline):
         self.unet.eval()
         self.vae.eval()
         self.text_encoder.eval()
-        #8.时间步上限：获取训练时的最大步数索引（999）
+        # 8.时间步上限：获取训练时的最大步数索引（999）
         self._max_unet_timestep = self.scheduler.config.num_train_timesteps - 1
         self._contextflow_layer_ratio = 0.25
         self._contextflow_threshold_tau = 0.5
         self._setup_contextflow_processors("insertion")
-        #9.安全检查器初始化
+        # 9.安全检查器初始化
         self._use_safety_checker = bool(use_safety_checker)
         self._safety_checker_id = safety_checker_id
         self._safety_checker: Optional[StableDiffusionSafetyChecker] = None
         self._safety_feature_extractor: Optional[CLIPImageProcessor] = None
 
-        # 如果开启了安全检查，则执行初始化逻辑·
+        # 如果开启了安全检查，则执行初始化逻辑
         if self._use_safety_checker:
             self._init_safety_checker()
 
-    def _set_compute_precision(self) -> None: #内部工具函数：遍历核心模块，确保它们的计算精度Dtype一致，防止计算冲突报错
+    def _set_compute_precision(self) -> None:   # 内部工具函数：遍历核心模块，确保它们的计算精度Dtype一致，防止计算冲突报错
         modules = (self.unet, self.vae, self.text_encoder)
         for module in modules:
             if module is not None:
                 module.to(device=self._device, dtype=self._compute_dtype)
 
-    def _setup_contextflow_processors(self, task_type: str = "insertion") -> None:
+    def _setup_contextflow_processors(self, task_type: str = "insertion", custom_layer_ratio: Optional[float] = None) -> None:
         """
         改进3：根据任务类型（插入/替换/删除）动态选择最佳的特征注入层。
-        基于 ContextFlow 论文的 Guidance Responsiveness Metric 结论：
-        - Insertion (插入): 浅层 (前25%)，保留空间布局，留出生成空间。
-        - Swapping (替换): 中层 (中间50%)，改变语义实体。
-        - Deletion (删除): 深层 (后50%)，抹除特定对象概念。
+        支持通过 custom_layer_ratio 动态调整浅层注入的深度。
         """
         processor_names = list(self.unet.attn_processors.keys())
         total_layers = len(processor_names)
@@ -288,7 +299,9 @@ class ChordEditPipeline(DiffusionPipeline):
             
         task = task_type.lower()
         if task in ["insert", "insertion", "object_insertion", "object-insertion"]:
-            start_ratio, end_ratio = 0.0, 0.25
+            start_ratio = 0.0
+            # <--- 核心修改：如果有自定义比例就用自定义的，没有就用默认的
+            end_ratio = custom_layer_ratio if custom_layer_ratio is not None else 0.25
         elif task in ["swap", "swapping", "object_swapping", "object-swapping"]:
             start_ratio, end_ratio = 0.25, 0.75
         elif task in ["delete", "deletion", "remove", "removal"]:
@@ -335,7 +348,7 @@ class ChordEditPipeline(DiffusionPipeline):
         default_edit_config: Optional[Dict[str, Any]] = None,
         device: Optional[str | torch.device] = None, 
         torch_dtype: torch.dtype = torch.float32,
-        image_size: int = 512, #image_size=52
+        image_size: int = 512,  # image_size=512
         use_center_crop: bool = True,
         compute_dtype: torch.dtype = DEFAULT_COMPUTE_DTYPE,
         use_attention_mask: bool = False,
@@ -409,17 +422,21 @@ class ChordEditPipeline(DiffusionPipeline):
     #3.文本编码：把源文本和目标文本转换成CLIP的特征向量，作为UNet的条件输入
         src_embed = self.encode_prompt([source_prompt]) #src_embed:源文本的CLIP特征，[1, 77, 768]，77：文本的序列长度（padding后），768是每个token的特征维度
         tgt_embed = self.encode_prompt([target_prompt]) #tgt_embed: [1, 77, 768] - 目标文本的CLIP特征
-    #4. 准备编辑参数和噪声
-        #准备输出容器
+    #4. 准备编辑参数、ContextFlow 层级和初始随机噪声      
         output_latents: List[torch.Tensor] = []
         decoded_batches: List[torch.Tensor] = []
 
         #格式化编辑参数
         edit_params = self._prepare_edit_params(cfg)
         seed_value = int(seed) if seed is not None else DEFAULT_SEED
+        #获取动态比例（如果配置里没有，则默认使用0.25）
+        current_layer_ratio = edit_params.get("contextflow_layer_ratio", 0.25)
         
-        # 根据当前任务动态配置注意力层
-        self._setup_contextflow_processors(edit_params.get("edit_task", "insertion"))
+        #将自定义比例传给层分配函数
+        self._setup_contextflow_processors(
+            task_type=edit_params.get("edit_task", "insertion"),
+            custom_layer_ratio=current_layer_ratio
+        )
 
         #生成多个噪声样本 
         #noise_list: 每个元素是 [1, 4, 64, 64] 的随机噪声
@@ -479,11 +496,13 @@ class ChordEditPipeline(DiffusionPipeline):
         seed: Optional[int] = None,
         output_type: str = "pil",
         threshold_tau: float = 0.5,
+        layer_ratio: float = 0.25, # ---新增参数---
     ) -> ChordEditPipelineOutput:
         cfg = dict(edit_config or {})
         cfg["contextflow_enabled"] = True
         cfg["edit_task"] = "insertion"
         cfg["contextflow_threshold_tau"] = float(threshold_tau)
+        cfg["contextflow_layer_ratio"] = float(layer_ratio) # ---写入配置---
         return self(
             image=image,
             source_prompt=source_prompt,
@@ -734,6 +753,11 @@ class ChordEditPipeline(DiffusionPipeline):
         params["contextflow_threshold_tau"] = float(
             max(0.0, min(1.0, float(params.get("contextflow_threshold_tau", self._contextflow_threshold_tau))))
         )
+        # --- 新增这行，解析自定义的层数比例 ---
+        params["contextflow_layer_ratio"] = float(
+            max(0.0, min(1.0, float(params.get("contextflow_layer_ratio", self._contextflow_layer_ratio))))
+        )
+
         return params
 
     def _prepare_noise_list(
@@ -762,6 +786,19 @@ class ChordEditPipeline(DiffusionPipeline):
         return torch.full((batch,), idx, device=device, dtype=dtype)
 
     def _get_alpha_sigma(self, tensor: torch.Tensor, timesteps: torch.Tensor):
+        """
+        获取扩散过程的缩放系数。
+        作用: 根据给定的时间步 timesteps，从 scheduler 中提取对应的 alpha 和 sigma。
+        物理含义: 
+            alpha_t: 原始信号(图像)的保留比例。时间步越大(越接近纯噪声)，alpha 越小。
+            sigma_t: 添加噪声的比例。时间步越大，sigma 越大。
+            满足公式: z_t = alpha_t * x_0 + sigma_t * noise
+        输入:
+            - tensor: 用于参考 shape、dtype 和 device 的张量。
+            - timesteps: 当前所处的时间步索引 [Batch]
+        输出:
+            - alpha_t, sigma_t: 对应时间步的扩散系数 [Batch, 1, 1, 1]
+        """
         # alphas_cumprod: 累积乘积，来自scheduler
         alphas_cumprod = self.scheduler.alphas_cumprod.to(dtype=torch.float32, device=tensor.device)
         alpha_t = alphas_cumprod[timesteps].sqrt().view(-1, 1, 1, 1)  
@@ -774,15 +811,23 @@ class ChordEditPipeline(DiffusionPipeline):
 
     def _pred_x0(self, x_anchor, timesteps, cond, noise):
         """
-        从带噪图像预测干净图像 x0
-        作用：强制对齐图像流形，去除模糊
+        从带噪图像直接预测干净图像 x0 (主要用于 cleanup 阶段)。
+        作用: 强制对齐图像流形，去除因为截断误差导致的最后一点模糊感。
+        物理含义: 利用 UNet 预测出当前图像中的噪声成分，然后将其减去，从而暴露底层的真实结构。
+        输入:
+            - x_anchor: 当前的 latent 状态 [B, C, H, W]
+            - timesteps: 对应的时间步索引
+            - cond: 用于引导去噪的文本条件
+            - noise: 注入的基础噪声
+        输出:
+            - x0_pred: 预测出的纯净 latent [B, C, H, W]
         """
         # 获取扩散系数
         # alpha_t: 信号保留比例（越大表示图像越清晰）；# sigma_t: 噪声比例（越大表示噪点越多）
         alpha_t, sigma_t = self._get_alpha_sigma(x_anchor, timesteps) #x_anchor: [1, 4, 64, 64] - 当前latent ；# timesteps.shape: [1]
         # 添加噪声：从当前图像得到带噪版本
         z_t = alpha_t * x_anchor + sigma_t * noise
-        #UNet 预测噪声
+        # UNet 预测噪声
         noise_pred = self.unet(
             sample=z_t,     # 带噪图像
             timestep=timesteps, # 当前时间步（告诉UNet现在是第几步）
@@ -801,11 +846,20 @@ class ChordEditPipeline(DiffusionPipeline):
         cond: torch.Tensor,
         *,
         recon_cond: Optional[torch.Tensor] = None,
+        recon_sample: Optional[torch.Tensor] = None, # [新增参数] 传入纯净的重建样本
         use_contextflow: bool = False,
     ) -> torch.Tensor:
         """
         单步去噪的噪声预测封装。
         如果启用了 ContextFlow，将自动构建“双路径”并行计算。
+        
+        输入:
+        - sample: 当前编辑分支的加噪样本 [B, 4, 64, 64]
+        - timesteps: 当前时间步
+        - cond: 编辑分支的文本特征 (目标描述)
+        - recon_cond: 重建分支的文本特征 (源描述)
+        - recon_sample: 重建分支的纯净加噪样本 (原图加噪)，专供提取背景 KV
+        - use_contextflow: 是否开启上下文富集
         """
         # [常规分支] 不使用 ContextFlow 或没有提供重建条件时，走标准的 UNet 前向
         if not use_contextflow or recon_cond is None:
@@ -818,9 +872,11 @@ class ChordEditPipeline(DiffusionPipeline):
             
         # [双路径分支] ContextFlow 启用时：
         # 1. 在 Batch 维度拼接，构建并行路径: [重建分支, 编辑分支]
-        paired_sample = torch.cat([sample, sample], dim=0)       # 形状: [2, 4, 64, 64]
-        paired_timesteps = torch.cat([timesteps, timesteps], dim=0) # 形状: [2]
-        paired_cond = torch.cat([recon_cond, cond], dim=0)       # 形状: [2, 77, 768]
+        # 如果没有传入独立的 recon_sample，就回退到使用当前 sample
+        r_sample = recon_sample if recon_sample is not None else sample
+        paired_sample = torch.cat([r_sample, sample], dim=0)       # 形状: [2*N, 4, 64, 64]
+        paired_timesteps = torch.cat([timesteps, timesteps], dim=0) # 形状: [2*N]
+        paired_cond = torch.cat([recon_cond, cond], dim=0)       # 形状: [2*N, 77, 768]
         
         # 2. 传递控制信号给注意力层
         context_state = {"enabled": True, "mode": "paired"}
@@ -845,22 +901,29 @@ class ChordEditPipeline(DiffusionPipeline):
         cond: torch.Tensor,
         *,
         recon_cond: Optional[torch.Tensor] = None,
+        recon_sample: Optional[torch.Tensor] = None, # [新增参数] 传入纯净的重建样本
         use_contextflow: bool = False,
     ) -> torch.Tensor:
+        """
+        根据带噪图像 z_t 和预测出的噪声，反推回 t=0 时的清晰图像 x_0。
+        """
         alpha_t, sigma_t = self._get_alpha_sigma(z_t, timesteps)
         noise_pred = self._predict_noise(
             sample=z_t,
             timesteps=timesteps,
             cond=cond,
             recon_cond=recon_cond,
+            recon_sample=recon_sample, # 向下传递给 _predict_noise
             use_contextflow=use_contextflow,
         )
+        # 这是扩散模型的核心公式：x0 = (z_t - sigma_t * noise_pred) / alpha_t
         return (z_t - sigma_t * noise_pred) / alpha_t
 
 #_u_estimate 函数：计算修改方向
     def _u_estimate(
         self,
-        x_anchor,
+        x_src,       # [新增] 永远纯净的原图 (专供重建分支提取KV)
+        x_anchor,    # 当前带有编辑痕迹的图 (专供编辑分支)
         src_embed,
         edit_embed,
         noise,
@@ -869,13 +932,17 @@ class ChordEditPipeline(DiffusionPipeline):
         *,
         use_contextflow: bool = False,
     ):
+        """
+        在 Latent 空间中，计算当前时间步的编辑位移向量 u_hat。
+        物理含义: 指向“目标文本语义”减去“原始文本语义”的方向，告诉模型下一步该往哪走。
+        """
         # 1. 获取基础元信息：batch_size 以及设备信息 (确保计算在同一块 GPU 上)
         batch, device = x_anchor.shape[0], x_anchor.device  #x_anchor: 当前图像在 Latent 空间的特征,Shape [1, 4, 64, 64]
         # 2. 将 [0,1] 的浮点时间戳转为扩散模型能够识别的整数步数 (如 0-999)
         t_idx_s = self._time_to_index(batch, t_s, device=device) #t_idx_s:当前时间步的“模糊程度”,t_s：当前时间步，1表示纯噪声，0表示干净图像
         t_idx_s0 = self._time_to_index(batch, max(0.0, t_s - delta), device=device) #t_idx_s0: 向前平移 delta 后的时间步索引,t_s - delta：稍微"更干净"的时间步
 
-        # 3. 改进2: 向量化处理所有噪声样本，消除 for 循环，大幅提升效率
+        # 3. 向量化处理所有噪声样本，消除 for 循环，大幅提升效率
         if isinstance(noise, (list, tuple)):
             noise_tensor = torch.cat(noise, dim=0) # [num_noises, 4, 64, 64]
         else:
@@ -884,8 +951,9 @@ class ChordEditPipeline(DiffusionPipeline):
         num_noises = noise_tensor.shape[0]
         
         # 沿着 Batch 维度扩展所有输入张量，以便一次性并行计算
-        # 改进1：使用 expand 代替 repeat 优化内存占用
+        # 使用 expand 代替 repeat 优化内存占用
         x_anchor_batch = x_anchor.expand(num_noises, -1, -1, -1)     # [num_noises, 4, 64, 64]
+        x_src_batch = x_src.expand(num_noises, -1, -1, -1)           # [新增] 扩展纯净原图
         src_embed_batch = src_embed.expand(num_noises, -1, -1)      # [num_noises, 77, 768]
         edit_embed_batch = edit_embed.expand(num_noises, -1, -1)    # [num_noises, 77, 768]
         
@@ -897,18 +965,22 @@ class ChordEditPipeline(DiffusionPipeline):
         alpha_s, sigma_s = self._get_alpha_sigma(x_anchor_batch, t_idx_s_batch)
         alpha_prev, sigma_prev = self._get_alpha_sigma(x_anchor_batch, t_idx_s0_batch)
 
-        # 并行计算加噪状态
-        z_s = alpha_s * x_anchor_batch + sigma_s * noise_tensor
-        z_prev = alpha_prev * x_anchor_batch + sigma_prev * noise_tensor
+        # 5. 并行计算加噪状态 (当前编辑图)
+        z_s_curr = alpha_s * x_anchor_batch + sigma_s * noise_tensor
+        z_prev_curr = alpha_prev * x_anchor_batch + sigma_prev * noise_tensor
         
-        # 并行预测 x0 (一次网络前向传播处理所有噪声)
-        x_src_p_s = self._predict_x0_from_noisy(z_s, t_idx_s_batch, src_embed_batch, use_contextflow=False)
-        x_tar_p_s = self._predict_x0_from_noisy(z_s, t_idx_s_batch, edit_embed_batch, recon_cond=src_embed_batch, use_contextflow=use_contextflow)
+        # [新增] 并行计算加噪状态 (纯净原图，专供重建分支)
+        z_s_pure = alpha_s * x_src_batch + sigma_s * noise_tensor
+        z_prev_pure = alpha_prev * x_src_batch + sigma_prev * noise_tensor
         
-        x_src_p_s0 = self._predict_x0_from_noisy(z_prev, t_idx_s0_batch, src_embed_batch, use_contextflow=False)
-        x_tar_p_s0 = self._predict_x0_from_noisy(z_prev, t_idx_s0_batch, edit_embed_batch, recon_cond=src_embed_batch, use_contextflow=use_contextflow)
+        # 6. 并行预测 x0 (一次网络前向传播处理所有噪声)
+        x_src_p_s = self._predict_x0_from_noisy(z_s_curr, t_idx_s_batch, src_embed_batch, recon_sample=None, use_contextflow=False)
+        x_tar_p_s = self._predict_x0_from_noisy(z_s_curr, t_idx_s_batch, edit_embed_batch, recon_cond=src_embed_batch, recon_sample=z_s_pure, use_contextflow=use_contextflow)
         
-        # 计算方向并沿着 num_noises 维度求平均
+        x_src_p_s0 = self._predict_x0_from_noisy(z_prev_curr, t_idx_s0_batch, src_embed_batch, recon_sample=None, use_contextflow=False)
+        x_tar_p_s0 = self._predict_x0_from_noisy(z_prev_curr, t_idx_s0_batch, edit_embed_batch, recon_cond=src_embed_batch, recon_sample=z_prev_pure, use_contextflow=use_contextflow)
+        
+        # 7. 计算方向并沿着 num_noises 维度求平均
         dv_s_batch = x_tar_p_s - x_src_p_s
         dv_s0_batch = x_tar_p_s0 - x_src_p_s0
         
@@ -916,7 +988,7 @@ class ChordEditPipeline(DiffusionPipeline):
         dv_s0 = dv_s0_batch.mean(dim=0, keepdim=True)
        
 
-    #时间修正与加权平衡：
+    # 8. 时间修正与加权平衡：
     # denom: 时间分母，防止除零
         denom = (t_s + delta) #denom：分母（时间修正）
         if denom <= 1e-6:
@@ -964,7 +1036,8 @@ class ChordEditPipeline(DiffusionPipeline):
         #u_hat: 当前时间步的修改方向，编辑位移向量
         #物理含义：在latent空间中，指向“目标文本语义” 减去“原始文本语义” 的方向
             u_hat = self._u_estimate(  # u_hat：这一步要走的方向和距离,是一个【方向向量】，指向目标文本的语义方向
-                x_curr,   # 当前latent
+                x_src,     # [新增] 永远纯净的原图 (专供重建分支提取KV)
+                x_curr,    # 当前latent
                 src_embed, #原始描述
                 edit_embed, #目标描述
                 noise,     #噪声样本

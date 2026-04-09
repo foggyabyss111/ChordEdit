@@ -284,19 +284,21 @@ def build_demo(
     default_edit_config: Dict[str, Any],
     examples: List[List[Any]],
 ) -> gr.Blocks:
-    #run_edit :将网页上用户的点击操作和输入，转换成 Python 能够处理的变量和数值
+    # run_edit: 将网页上用户的点击操作和输入，转换成 Python 能够处理的变量和数值，并触发模型运行。
     def run_edit(
-        image: Optional[Image.Image],  #网页上传的图片
-        source_prompt: str,      #用户输入的“原图描述”
-        target_prompt: str,      #用户输入的“目标描述”
-        seed: float,             #随机种子，控制生成的随机性
-        n_samples: float,
-        t_start: float,
-        t_end: float,
-        t_delta: float,
-        step_scale: float,
-        insertion_mode: bool,
-        insertion_threshold_tau: float,
+        image: Optional[Image.Image],  # 网页上传的源图片
+        source_prompt: str,      # 用户输入的“原图描述” (Source Prompt)
+        target_prompt: str,      # 用户输入的“目标描述” (Target Prompt)
+        seed: float,             # 随机种子，控制生成的随机性
+        n_samples: float,        # 一次生成方向估计所需的噪声样本数量 (提高稳定性)
+        n_steps: float,          # 编辑过程的迭代步数 (默认走1步，步数越多修改越细致)
+        t_start: float,          # 编辑强度起点 (0~1): 从多大比例的噪声开始编辑，值越大改动越大
+        t_end: float,            # 编辑强度终点 (0~1): 到多大比例的噪声停止编辑，值越小细节越真实
+        t_delta: float,          # 差分步长 (0~1): 估计编辑方向时“偷看”下一步的距离
+        step_scale: float,       # 步长缩放系数: 控制每一“刀”切多深，决定目标特征的显现程度
+        insertion_mode: bool,    # 是否开启“物体插入模式” (基于 ContextFlow)
+        insertion_threshold_tau: float, # 插入模式的时间窗口阈值: 仅在前 50% (0.5) 阶段开启背景保护
+        insertion_layer_ratio: float,   # 插入模式的深度比例: 控制浅层锁定特征的具体深度 (默认0.25)
     ) -> Image.Image:
         #1.验证输入：防止用户没传图就点运行
         _validate_inputs(image, source_prompt, target_prompt, t_start, t_end, t_delta)
@@ -305,7 +307,7 @@ def build_demo(
         #2. 组装配置字典：把网页滑块的值打包好，将UI参数传递给模型
         edit_config = {
             "noise_samples": int(n_samples),
-            "n_steps": int(default_edit_config.get("n_steps", 1)),
+            "n_steps": int(n_steps), # <--- 从界面获取 n_steps
             "t_start": float(t_start),
             "t_end": float(t_end),
             "t_delta": float(t_delta),
@@ -322,6 +324,7 @@ def build_demo(
                     edit_config=edit_config,
                     seed=seed_int,
                     threshold_tau=float(insertion_threshold_tau),
+                    layer_ratio=float(insertion_layer_ratio), # <--- 修正1: 添加这里，将UI参数传给insert_object
                 )
             else:
                 result = pipeline(
@@ -330,6 +333,7 @@ def build_demo(
                     target_prompt=target_prompt.strip(),
                     edit_config=edit_config,
                     seed=seed_int,
+                    # <--- 修正2: 移除 pipeline.__call__ 中不支持的 kwargs (原先多传了 threshold_tau 和 layer_ratio 会报错)
                 )
         except Exception as exc:
             LOGGER.exception("Editing failed.")
@@ -388,15 +392,15 @@ def build_demo(
                     # seed_input: 随机数种子输入框。precision=0 表示只能输入整数
                     seed_input = gr.Number(label="Seed", value=int(default_seed), precision=0)
 
-                    # n_samples_input: 采样数量滑块。物理含义：一次生成几张图供参考
-                    n_samples_input = gr.Slider(  #gr.Slider:调节阀
+                    # n_samples_input: 噪声样本数量。物理含义：每次估算编辑方向时用的随机噪声数，越多越平滑但更慢
+                    n_samples_input = gr.Slider(  
                         label="n_samples",
                         minimum=1,
                         maximum=16,
-                        step=1,  #每次拖动的最小间距
+                        step=1,  # 每次拖动的最小间距
                         value=n_samples_default,
                     )
-                    # step_scale_input: 编辑步长缩放。物理含义：每一刀切多深（修改幅度）
+                    # step_scale_input: 编辑步长缩放。物理含义：决定目标特征被强化的程度（类似编辑幅度）
                     step_scale_input = gr.Slider(
                         label="step_scale",
                         minimum=0.1,
@@ -404,7 +408,16 @@ def build_demo(
                         step=0.1,
                         value=float(default_edit_config.get("step_scale", 1.0)),
                     )
+                    # n_steps_input: 迭代步数。物理含义：从高噪声向低噪声滑落时的分步数量
+                    n_steps_input = gr.Slider(
+                        label="n_steps",
+                        minimum=1,
+                        maximum=10,
+                        step=1,
+                        value=int(default_edit_config.get("n_steps", 1)),
+                    )
                 with gr.Row():
+                    # t_start_input: 编辑起点，物理含义：值越接近1，模型允许改动的地方就越多
                     t_start_input = gr.Slider(
                         label="t_start",
                         minimum=0.01,
@@ -412,6 +425,7 @@ def build_demo(
                         step=0.01,
                         value=float(default_edit_config.get("t_start", 0.90)), 
                     )
+                    # t_end_input: 编辑终点，物理含义：值越接近0，最后输出的图像细节就越还原原图
                     t_end_input = gr.Slider(
                         label="t_end",
                         minimum=0.0,
@@ -419,6 +433,7 @@ def build_demo(
                         step=0.01,
                         value=float(default_edit_config.get("t_end", 0.30)),
                     )
+                    # t_delta_input: 差分步长，物理含义：估计方向时的“视野前瞻”距离
                     t_delta_input = gr.Slider(
                         label="t_delta",
                         minimum=0.0,
@@ -427,16 +442,26 @@ def build_demo(
                         value=float(default_edit_config.get("t_delta", 0.15)),
                     )
                 with gr.Row():
+                    # insertion_mode_input: 是否开启 ContextFlow 物体插入模式
                     insertion_mode_input = gr.Checkbox(
                         label="Object Insertion Mode",
                         value=DEFAULT_INSERTION_MODE,
                     )
+                    # insertion_threshold_tau_input: 插入模式开启的时间阈值。物理含义：只在去噪过程的前段施加引导
                     insertion_threshold_tau_input = gr.Slider(
                         label="Insertion threshold_tau",
                         minimum=0.0,
                         maximum=1.0,
                         step=0.01,
                         value=DEFAULT_INSERTION_THRESHOLD_TAU,
+                    )
+                    # insertion_layer_ratio_input: 插入模式的深度。物理含义：影响锁定原图多少层深度的特征结构
+                    insertion_layer_ratio_input = gr.Slider(
+                        label="Insertion layer_ratio (Depth)",
+                        minimum=0.0,
+                        maximum=1.0,
+                        step=0.05,
+                        value=0.25,
                     )
                 run_button = gr.Button("Run Edit", variant="primary")
 
@@ -455,12 +480,14 @@ def build_demo(
             target_prompt,
             seed_input,
             n_samples_input,
+            n_steps_input, # <--- 对应新加的输入参数
             t_start_input,
             t_end_input,
             t_delta_input,
             step_scale_input,
             insertion_mode_input,
             insertion_threshold_tau_input,
+            insertion_layer_ratio_input,
         ]
 
         run_button.click(fn=run_edit, inputs=run_inputs, outputs=output_image)
